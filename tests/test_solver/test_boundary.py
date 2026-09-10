@@ -1,17 +1,28 @@
 """Tests for the CLT LoadState -> 3-D boundary-condition conversion.
 
-Covers the two parallel converters identified in issue #96:
+``BoundaryHandler.load_state_to_bcs`` is the single definition of this
+mapping; ``StaticSolver._load_state_to_bcs`` delegates to it. (It used to
+carry a second, divergent implementation — issue #96 — which clamped the
+whole ``x_min`` face and silently ignored ``Ny``/``Mx``/``My``.)
 
-- ``BoundaryHandler.load_state_to_bcs`` (``solver/boundary.py``)
-- ``StaticSolver._load_state_to_bcs`` (``solver/static.py``), the private
-  path actually used by ``StaticSolver.run_clt_load``.
+**Membrane states are applied as self-equilibrated tractions on all four
+in-plane faces**, with rigid-body motion removed at three points. That
+matters and is not cosmetic: the previous per-resultant scheme loaded only
+``x_max`` and clamped or symmetry-fixed the opposing faces, which turns a
+uniform state into a cantilever reaction. Its ``Nxy`` shear came out 37 %
+high, and ``Nx + Nxy`` came out with the *wrong sign* on the shear strain,
+because the ``symmetry_y`` plane the ``Nx`` branch added restrains exactly
+the deformation the shear traction is trying to produce.
 
-The assertions are physically grounded: total applied face force is
-checked through the *consistent face integration* path established by
-PR #137 / issue #50 (``BoundaryHandler.get_force_dofs``), so the sum of
-nodal forces equals the prescribed CLT resultant.  Rigid-body
-suppression and the structural divergence between the two converters are
-pinned so future drift is caught.
+The tests that let that through asserted only the *shape* of the BC list —
+which face, which DOF, what total force, and that force vectors superpose.
+None of them solved. So the classes below are in two layers:
+
+1. **Structure**: per-face totals, the traction pairing, the anchor set.
+2. **Physics** (``TestMembraneAgainstCLT``): solve a flat laminate and
+   compare the recovered strains against ``Laminate.midplane_strains``.
+   That layer is what actually pins the mapping; it is independent of how
+   the BCs are spelled.
 """
 
 import numpy as np
@@ -86,8 +97,25 @@ def _bc_kinds(bcs):
 
 
 def _node_fix_bcs(bcs):
-    """BCs that pin explicit node_ids (the rigid-body corner fixes)."""
+    """BCs that pin explicit node_ids (the rigid-body anchors)."""
     return [b for b in bcs if b.node_ids is not None and b.bc_type == "fixed"]
+
+
+def _face_force(mesh, bcs, face, dof):
+    """Total applied force on one face in one direction.
+
+    The membrane load set is self-equilibrated, so the *net* force over the
+    whole body is zero by construction; the per-face total is the quantity
+    that has to equal the CLT resultant times the loaded edge length.
+    """
+    sel = [b for b in bcs
+           if b.bc_type == "pressure" and b.face == face and b.dofs == [dof]]
+    return BoundaryHandler(mesh).get_force_dofs(sel)[dof::3].sum()
+
+
+def _anchor_dofs(bcs):
+    """The rigid-body anchor pattern as a sorted list of dof-lists."""
+    return sorted(sorted(b.dofs) for b in _node_fix_bcs(bcs))
 
 
 # ======================================================================
@@ -116,203 +144,213 @@ class TestNoLoad:
 
 
 # ======================================================================
-# Pure Nx
+# Structure: rigid-body anchors
 # ======================================================================
 
-class TestPureNx:
-    """Uniaxial Nx -> pressure on x_max, light rigid-body suppression."""
+class TestRigidBodyAnchors:
+    """Six point constraints, and nothing that restrains a strain."""
 
-    def test_pressure_bc_on_xmax(self, small_mesh):
-        Lx, Ly, Lz = small_mesh.domain_size
+    def test_anchor_pattern(self, small_mesh):
         bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nx=100.0), small_mesh)
-        press = [b for b in bcs if b.bc_type == "pressure"]
-        assert len(press) == 1
-        bc = press[0]
-        assert bc.face == "x_max"
-        assert bc.dofs == [0]
-        # CLT Nx is force/width: total face force = Nx * Ly.
-        assert bc.value == pytest.approx(100.0 * Ly)
+        assert _anchor_dofs(bcs) == [[0, 1, 2], [1, 2], [2]]
 
-    def test_total_force_equals_resultant(self, small_mesh):
-        """Consistent face integration (#137): sum of nodal forces == Nx*Ly."""
-        Lx, Ly, Lz = small_mesh.domain_size
-        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nx=100.0), small_mesh)
-        fx, fy, fz = _force_components(small_mesh, bcs)
-        assert fx == pytest.approx(100.0 * Ly)
-        # No spurious force in unloaded directions.
-        assert fy == pytest.approx(0.0)
-        assert fz == pytest.approx(0.0)
+    def test_no_face_fixes_at_all(self, small_mesh):
+        """A face fix would restrain the deformation being applied.
 
-    def test_rigidbody_suppression_not_overconstrained(self, small_mesh):
-        """x_min fixed only in x (not fully clamped); y_min symmetry;
-        exactly one corner node pins the remaining y/z rigid modes."""
-        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nx=100.0), small_mesh)
-        kinds = _bc_kinds(bcs)
-        assert "fixed" in kinds and "symmetry_y" in kinds
-        xmin_fix = [b for b in bcs
-                    if b.bc_type == "fixed" and b.face == "x_min"]
-        assert len(xmin_fix) == 1
-        # Only ux constrained on x_min -> y/z free (no over-constraint).
-        assert xmin_fix[0].dofs == [0]
-        nodefix = _node_fix_bcs(bcs)
-        assert len(nodefix) == 1
-        assert sorted(nodefix[0].dofs) == [1, 2]
-
-    def test_force_sign_follows_nx_sign(self, small_mesh):
-        Lx, Ly, Lz = small_mesh.domain_size
-        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nx=-250.0), small_mesh)
-        fx, _, _ = _force_components(small_mesh, bcs)
-        assert fx == pytest.approx(-250.0 * Ly)
-
-
-# ======================================================================
-# Pure Ny (symmetric to Nx on the y faces)
-# ======================================================================
-
-class TestPureNy:
-    """Uniaxial Ny -> pressure on y_max with mirrored constraints."""
-
-    def test_pressure_bc_on_ymax(self, small_mesh):
-        Lx, Ly, Lz = small_mesh.domain_size
-        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Ny=50.0), small_mesh)
-        press = [b for b in bcs if b.bc_type == "pressure"]
-        assert len(press) == 1
-        bc = press[0]
-        assert bc.face == "y_max"
-        assert bc.dofs == [1]
-        assert bc.value == pytest.approx(50.0 * Lx)
-
-    def test_total_force_equals_resultant(self, small_mesh):
-        Lx, Ly, Lz = small_mesh.domain_size
-        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Ny=50.0), small_mesh)
-        fx, fy, fz = _force_components(small_mesh, bcs)
-        assert fy == pytest.approx(50.0 * Lx)
-        assert fx == pytest.approx(0.0)
-        assert fz == pytest.approx(0.0)
-
-    def test_symmetry_x_added_when_nx_zero(self, small_mesh):
-        """When Nx == 0 the Ny branch supplies the x-symmetry + corner
-        fix itself (boundary.py:564-571)."""
-        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Ny=50.0), small_mesh)
-        kinds = _bc_kinds(bcs)
-        assert "symmetry_x" in kinds
-        ymin_fix = [b for b in bcs
-                    if b.bc_type == "fixed" and b.face == "y_min"]
-        assert len(ymin_fix) == 1
-        assert ymin_fix[0].dofs == [1]
-        nodefix = _node_fix_bcs(bcs)
-        assert len(nodefix) == 1
-        assert sorted(nodefix[0].dofs) == [0, 2]
-
-
-# ======================================================================
-# Combined Nx + Ny: corner-fix added exactly once
-# ======================================================================
-
-class TestCombinedNxNy:
-    """The Ny branch must NOT re-add the corner fix when Nx already did."""
-
-    def test_corner_fix_added_once(self, small_mesh):
+        This is the assertion that would have prevented the shear defect:
+        the old scheme's ``symmetry_y`` on ``y_min`` is precisely what made
+        ``Nx + Nxy`` come out with the wrong sign.
+        """
         bcs = BoundaryHandler.load_state_to_bcs(
-            LoadState(Nx=100.0, Ny=50.0), small_mesh
+            LoadState(Nx=100.0, Ny=50.0, Nxy=30.0), small_mesh
         )
-        nodefix = _node_fix_bcs(bcs)
-        assert len(nodefix) == 1, (
-            "Combined Nx+Ny must pin the rigid-body corner once, not twice"
-        )
-        # The single corner fix is the one from the Nx branch ([1, 2]).
-        assert sorted(nodefix[0].dofs) == [1, 2]
-        # No duplicate x-symmetry from the Ny branch when Nx != 0.
-        assert "symmetry_x" not in _bc_kinds(bcs)
+        for bc in bcs:
+            assert bc.bc_type not in ("symmetry_x", "symmetry_y", "symmetry_z")
+            assert not (bc.bc_type == "fixed" and bc.face is not None), (
+                f"membrane BCs must not fix a whole face, got {bc.face}"
+            )
 
-    def test_both_pressures_present(self, small_mesh):
-        Lx, Ly, Lz = small_mesh.domain_size
-        bcs = BoundaryHandler.load_state_to_bcs(
-            LoadState(Nx=100.0, Ny=50.0), small_mesh
-        )
-        press = [b for b in bcs if b.bc_type == "pressure"]
-        faces = sorted(b.face for b in press)
-        assert faces == ["x_max", "y_max"]
-        fx, fy, fz = _force_components(small_mesh, bcs)
-        assert fx == pytest.approx(100.0 * Ly)
-        assert fy == pytest.approx(50.0 * Lx)
-
-
-# ======================================================================
-# Pure Nxy (in-plane shear)
-# ======================================================================
-
-class TestPureNxy:
-    """Shear Nxy -> tangential pressure on x_max in the y-direction."""
-
-    def test_shear_pressure_bc(self, small_mesh):
-        Lx, Ly, Lz = small_mesh.domain_size
+    def test_anchors_are_three_distinct_nodes(self, small_mesh):
         bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nxy=30.0), small_mesh)
-        press = [b for b in bcs if b.bc_type == "pressure"]
-        assert len(press) == 1
-        bc = press[0]
-        assert bc.face == "x_max"
-        assert bc.dofs == [1], "shear traction acts in y on the x_max face"
-        assert bc.value == pytest.approx(30.0 * Ly)
+        ids = {int(b.node_ids[0]) for b in _node_fix_bcs(bcs)}
+        assert len(ids) == 3
 
-    def test_shear_force_and_equilibrium(self, small_mesh):
-        Lx, Ly, Lz = small_mesh.domain_size
-        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nxy=30.0), small_mesh)
-        fx, fy, fz = _force_components(small_mesh, bcs)
-        # Applied shear resultant == Nxy * (loaded edge length Ly).
-        assert fy == pytest.approx(30.0 * Ly)
-        # No net x or z force: reactions balance through the x_min clamp.
-        assert fx == pytest.approx(0.0)
-        assert fz == pytest.approx(0.0)
-
-    def test_shear_dof_constraint_pattern(self, small_mesh):
-        """With only Nxy, x_min is pinned in ux & uy; one node pins uz."""
-        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nxy=30.0), small_mesh)
-        xmin_fix = [b for b in bcs
-                    if b.bc_type == "fixed" and b.face == "x_min"]
-        assert len(xmin_fix) == 1
-        assert sorted(xmin_fix[0].dofs) == [0, 1]
-        nodefix = _node_fix_bcs(bcs)
-        assert len(nodefix) == 1
-        assert nodefix[0].dofs == [2]
+    def test_degenerate_footprint_is_rejected(self, single_ply_laminate):
+        """A mesh with no y extent cannot host the anchor set."""
+        mesh = WrinkleMesh(
+            laminate=single_ply_laminate, wrinkle_config=None,
+            Lx=3.0, Ly=2.0, nx=3, ny=2, nz_per_ply=1,
+        ).generate()
+        mesh.nodes[:, 1] = 0.0          # collapse the y extent
+        with pytest.raises(ValueError, match="rigid-body"):
+            BoundaryHandler.load_state_to_bcs(LoadState(Nx=1.0), mesh)
 
 
 # ======================================================================
-# Superposition: combined BCs == union of individual contributions
+# Structure: traction pairing and per-face totals
 # ======================================================================
 
-class TestSuperposition:
-    """For (Nx, Ny, Nxy) the combined BC list is the union of the
-    individually generated mechanical/force blocks; the assembled force
-    vector is the linear sum of the per-resultant force vectors."""
+class TestMembraneTractions:
+    """Every resultant loads BOTH opposing faces, equal and opposite."""
 
-    def test_force_vector_is_linear_sum(self, small_mesh):
-        handler = BoundaryHandler(small_mesh)
-        ls = LoadState(Nx=100.0, Ny=50.0, Nxy=30.0)
-        combined = BoundaryHandler.load_state_to_bcs(ls, small_mesh)
+    def test_nx_loads_both_x_faces(self, small_mesh):
+        Lx, Ly, _ = small_mesh.domain_size
+        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nx=100.0), small_mesh)
+        assert _face_force(small_mesh, bcs, "x_max", 0) == pytest.approx(100.0 * Ly)
+        assert _face_force(small_mesh, bcs, "x_min", 0) == pytest.approx(-100.0 * Ly)
 
-        f_nx = handler.get_force_dofs(
-            BoundaryHandler.load_state_to_bcs(LoadState(Nx=100.0), small_mesh))
-        f_ny = handler.get_force_dofs(
-            BoundaryHandler.load_state_to_bcs(LoadState(Ny=50.0), small_mesh))
-        f_nxy = handler.get_force_dofs(
-            BoundaryHandler.load_state_to_bcs(LoadState(Nxy=30.0), small_mesh))
-        f_combined = handler.get_force_dofs(combined)
+    def test_ny_loads_both_y_faces(self, small_mesh):
+        Lx, Ly, _ = small_mesh.domain_size
+        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Ny=50.0), small_mesh)
+        assert _face_force(small_mesh, bcs, "y_max", 1) == pytest.approx(50.0 * Lx)
+        assert _face_force(small_mesh, bcs, "y_min", 1) == pytest.approx(-50.0 * Lx)
 
-        np.testing.assert_allclose(
-            f_combined, f_nx + f_ny + f_nxy, rtol=1e-12, atol=1e-12
-        )
+    def test_nxy_is_a_complementary_shear_pair(self, small_mesh):
+        """Shear acts on the y-faces too — that is what makes it uniform.
 
-    def test_combined_totals(self, small_mesh):
-        Lx, Ly, Lz = small_mesh.domain_size
+        Loading only the x-faces (the old behaviour) is a tip-loaded
+        cantilever, and gave a shear strain 37 % above the CLT value.
+        """
+        Lx, Ly, _ = small_mesh.domain_size
+        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nxy=30.0), small_mesh)
+        assert _face_force(small_mesh, bcs, "x_max", 1) == pytest.approx(30.0 * Ly)
+        assert _face_force(small_mesh, bcs, "x_min", 1) == pytest.approx(-30.0 * Ly)
+        assert _face_force(small_mesh, bcs, "y_max", 0) == pytest.approx(30.0 * Lx)
+        assert _face_force(small_mesh, bcs, "y_min", 0) == pytest.approx(-30.0 * Lx)
+
+    def test_load_set_is_self_equilibrated(self, small_mesh):
+        """No net force on the body — the anchors carry no reaction."""
         bcs = BoundaryHandler.load_state_to_bcs(
             LoadState(Nx=100.0, Ny=50.0, Nxy=30.0), small_mesh
         )
         fx, fy, fz = _force_components(small_mesh, bcs)
-        assert fx == pytest.approx(100.0 * Ly)
-        # y-force = Ny*Lx contribution + Nxy*Ly shear contribution.
-        assert fy == pytest.approx(50.0 * Lx + 30.0 * Ly)
-        assert fz == pytest.approx(0.0)
+        assert fx == pytest.approx(0.0, abs=1e-9)
+        assert fy == pytest.approx(0.0, abs=1e-9)
+        assert fz == pytest.approx(0.0, abs=1e-9)
+
+    def test_force_sign_follows_resultant_sign(self, small_mesh):
+        Lx, Ly, _ = small_mesh.domain_size
+        bcs = BoundaryHandler.load_state_to_bcs(LoadState(Nx=-250.0), small_mesh)
+        assert _face_force(small_mesh, bcs, "x_max", 0) == pytest.approx(-250.0 * Ly)
+
+    def test_combined_state_superposes(self, small_mesh):
+        """The combined force vector is the sum of the individual ones."""
+        handler = BoundaryHandler(small_mesh)
+        ls = LoadState(Nx=100.0, Ny=50.0, Nxy=30.0)
+        combined = handler.get_force_dofs(
+            BoundaryHandler.load_state_to_bcs(ls, small_mesh))
+        parts = sum(
+            handler.get_force_dofs(
+                BoundaryHandler.load_state_to_bcs(one, small_mesh))
+            for one in (LoadState(Nx=100.0), LoadState(Ny=50.0),
+                        LoadState(Nxy=30.0))
+        )
+        np.testing.assert_allclose(combined, parts, rtol=1e-12, atol=1e-12)
+
+
+# ======================================================================
+# Physics: the layer that actually pins the mapping
+# ======================================================================
+
+@pytest.fixture(scope="module")
+def flat_qi_mesh_and_laminate():
+    """Flat quasi-isotropic laminate, fine enough to compare against CLT."""
+    lam = Laminate.from_angles(
+        [0.0, 45.0, -45.0, 90.0, 90.0, -45.0, 45.0, 0.0],
+        material=OrthotropicMaterial(), ply_thickness=0.125,
+    )
+    mesh = WrinkleMesh(
+        laminate=lam, wrinkle_config=None,
+        Lx=20.0, Ly=10.0, nx=10, ny=4, nz_per_ply=1,
+    ).generate()
+    return mesh, lam
+
+
+class TestMembraneAgainstCLT:
+    """Solve a flat laminate and compare with ``midplane_strains``.
+
+    A flat laminate under a uniform membrane state has a closed-form CLT
+    answer, and a correct BC mapping must reproduce it. Strains are
+    averaged over interior elements, away from the traction faces where the
+    discrete load introduces a boundary layer.
+
+    Measured agreement with the corrected mapping (and, for contrast, what
+    the previous per-resultant scheme gave):
+
+    ==================  ==============  ==============
+    state               corrected       previous
+    ==================  ==============  ==============
+    uniaxial ``Nx``     0.4 %           0.4 %
+    biaxial             0.3 %           0.3 %
+    pure shear          **0.4 %**       **37 %**
+    compression+shear   **0.2 %**       **wrong sign**
+    ==================  ==============  ==============
+    """
+
+    TOL = 0.06   # 6 % — a physics tolerance, not machine precision
+
+    @staticmethod
+    def _solve(mesh, lam, load):
+        bcs = BoundaryHandler.load_state_to_bcs(load, mesh)
+        res = StaticSolver(mesh, lam).solve(bcs, solver="direct")
+        centres = res.element_centers
+        Lx, Ly, _ = mesh.domain_size
+        interior = (
+            (np.abs(centres[:, 0] - Lx / 2.0) < 0.30 * Lx)
+            & (np.abs(centres[:, 1] - Ly / 2.0) < 0.35 * Ly)
+        )
+        assert interior.any()
+        eps = res.strain_global[interior].mean(axis=(0, 1))
+        # Voigt [11, 22, 33, 23, 13, 12] -> CLT [eps_x, eps_y, gamma_xy]
+        return np.array([eps[0], eps[1], eps[5]])
+
+    def _check(self, mesh, lam, load):
+        fe = self._solve(mesh, lam, load)
+        clt = lam.midplane_strains(load)[:3]
+        scale = np.abs(clt).max()
+        assert scale > 1e-6, "test load must produce a real strain"
+        for i, name in enumerate(("eps_x", "eps_y", "gamma_xy")):
+            assert abs(fe[i] - clt[i]) < self.TOL * scale, (
+                f"{name}: FE {fe[i]:.6e} vs CLT {clt[i]:.6e} "
+                f"(tolerance {self.TOL:.0%} of {scale:.3e})"
+            )
+
+    def test_uniaxial(self, flat_qi_mesh_and_laminate):
+        mesh, lam = flat_qi_mesh_and_laminate
+        self._check(mesh, lam, LoadState(Nx=-500.0))
+
+    def test_biaxial(self, flat_qi_mesh_and_laminate):
+        mesh, lam = flat_qi_mesh_and_laminate
+        self._check(mesh, lam, LoadState(Nx=-500.0, Ny=-250.0))
+
+    def test_pure_shear(self, flat_qi_mesh_and_laminate):
+        """The case the previous mapping got 37 % wrong."""
+        mesh, lam = flat_qi_mesh_and_laminate
+        self._check(mesh, lam, LoadState(Nxy=200.0))
+
+    def test_compression_plus_shear(self, flat_qi_mesh_and_laminate):
+        """The case the previous mapping got the *sign* wrong on."""
+        mesh, lam = flat_qi_mesh_and_laminate
+        self._check(mesh, lam, LoadState(Nx=-500.0, Nxy=200.0))
+
+    def test_full_membrane_state(self, flat_qi_mesh_and_laminate):
+        mesh, lam = flat_qi_mesh_and_laminate
+        self._check(mesh, lam, LoadState(Nx=-500.0, Ny=-250.0, Nxy=200.0))
+
+    def test_shear_strain_sign_follows_nxy(self, flat_qi_mesh_and_laminate):
+        """Reversing Nxy reverses the shear strain — and nothing else."""
+        mesh, lam = flat_qi_mesh_and_laminate
+        pos = self._solve(mesh, lam, LoadState(Nx=-500.0, Nxy=+200.0))
+        neg = self._solve(mesh, lam, LoadState(Nx=-500.0, Nxy=-200.0))
+        assert pos[2] > 0.0 and neg[2] < 0.0
+        assert pos[2] == pytest.approx(-neg[2], rel=0.02)
+        # The axial response is essentially unchanged by the shear sign:
+        # this layup is balanced, so A16 = A26 = 0 and CLT decouples shear
+        # from axial exactly. The FE interior average still differs by
+        # ~0.5 % between the two signs — a discretization effect from the
+        # traction boundary layer, which the finite averaging window does
+        # not sample symmetrically under sign reversal, not real coupling.
+        assert pos[0] == pytest.approx(neg[0], rel=0.01)
 
 
 # ======================================================================
@@ -346,19 +384,16 @@ class TestPureMx:
         for nid in xmax:
             zz = float(bending_mesh.nodes[nid, 2])
             assert disp[nid] == pytest.approx((Mx / D11) * (zz - z_mid) * Lx)
-        # Midplane node (z == z_mid) has zero prescribed displacement.
         mid = [nid for nid in xmax
                if abs(float(bending_mesh.nodes[nid, 2]) - z_mid) < 1e-9]
         assert mid, "expected an exact midplane node row on the bending mesh"
         for nid in mid:
             assert disp[nid] == pytest.approx(0.0)
-        # Top and bottom fiber displacements are equal and opposite.
         top = max(xmax, key=lambda n: bending_mesh.nodes[n, 2])
         bot = min(xmax, key=lambda n: bending_mesh.nodes[n, 2])
         assert disp[top] == pytest.approx(-disp[bot])
 
-    def test_curvature_should_scale_with_D11(self, bending_mesh,
-                                             two_ply_laminate):
+    def test_curvature_scales_with_D11(self, bending_mesh, two_ply_laminate):
         """Physically kappa_x must be Mx / D11 (fix for #149)."""
         Lx, Ly, Lz = bending_mesh.domain_size
         Mx = 2.0
@@ -371,119 +406,85 @@ class TestPureMx:
         z_mid = 0.5 * (z.min() + z.max())
         top = max(xmax, key=lambda n: bending_mesh.nodes[n, 2])
         z_top = float(bending_mesh.nodes[top, 2])
-        expected = (Mx / D11) * (z_top - z_mid) * Lx
-        assert disp[top] == pytest.approx(expected)
+        assert disp[top] == pytest.approx((Mx / D11) * (z_top - z_mid) * Lx)
 
-    def test_mx_adds_own_rigidbody_constraints(self, bending_mesh):
-        """With Nx == 0 the Mx branch supplies x_min fix, y-symmetry and
-        a single corner pin (boundary.py:610-619)."""
+    def test_bending_uses_the_same_anchor_set(self, bending_mesh):
         bcs = BoundaryHandler.load_state_to_bcs(LoadState(Mx=2.0), bending_mesh)
-        kinds = _bc_kinds(bcs)
-        assert "symmetry_y" in kinds
-        xmin_fix = [b for b in bcs
-                    if b.bc_type == "fixed" and b.face == "x_min"]
-        assert len(xmin_fix) == 1 and xmin_fix[0].dofs == [0]
-        nodefix = _node_fix_bcs(bcs)
-        assert len(nodefix) == 1 and sorted(nodefix[0].dofs) == [1, 2]
+        assert _anchor_dofs(bcs) == [[0, 1, 2], [1, 2], [2]]
+        for bc in bcs:
+            assert bc.bc_type not in ("symmetry_x", "symmetry_y", "symmetry_z")
 
 
 # ======================================================================
-# StaticSolver._load_state_to_bcs parity / divergence
+# Membrane + curvature is refused, not silently superposed
 # ======================================================================
 
-class TestStaticSolverConverter:
-    """The private converter used by StaticSolver.run_clt_load."""
+class TestMembranePlusBendingRejected:
+    """Prescribed displacement and traction on the same face don't mix.
 
-    def test_nx_total_force_matches_resultant(self, small_mesh,
-                                              single_ply_laminate):
-        """Total applied x-force == Nx * Ly via consistent integration."""
-        Lx, Ly, Lz = small_mesh.domain_size
+    The curvature terms prescribe ``ux`` on every ``x_max`` node while a
+    membrane state applies traction to that same face. Superposing them
+    describes neither load, so the mapping refuses rather than returning a
+    BC list whose solve means nothing.
+    """
+
+    @pytest.mark.parametrize("load", [
+        LoadState(Nx=100.0, Mx=2.0),
+        LoadState(Ny=50.0, My=2.0),
+        LoadState(Nxy=30.0, Mx=2.0),
+    ])
+    def test_combination_raises(self, bending_mesh, load):
+        with pytest.raises(ValueError, match="membrane.*curvature"):
+            BoundaryHandler.load_state_to_bcs(load, bending_mesh)
+
+    def test_message_names_both_groups(self, bending_mesh):
+        with pytest.raises(ValueError) as exc:
+            BoundaryHandler.load_state_to_bcs(
+                LoadState(Nx=100.0, Mx=2.0), bending_mesh)
+        msg = str(exc.value)
+        assert "Nx/Ny/Nxy" in msg and "Mx/My" in msg
+
+
+# ======================================================================
+# StaticSolver._load_state_to_bcs now delegates (was a second converter)
+# ======================================================================
+
+class TestStaticSolverConverterDelegates:
+    """Issue #96's "two parallel converters" are now one.
+
+    The private converter used to clamp the whole ``x_min`` face and read
+    only ``Nx``/``Nxy`` — so a state carrying ``Ny``, ``Mx`` or ``My`` was
+    solved as though those components were zero, silently. It now delegates,
+    so there is nothing left to diverge.
+    """
+
+    @pytest.mark.parametrize("load", [
+        LoadState(Nx=100.0),
+        LoadState(Nxy=30.0),
+        LoadState(Nx=100.0, Ny=50.0, Nxy=30.0),
+        LoadState(),
+    ])
+    def test_identical_bc_lists(self, small_mesh, single_ply_laminate, load):
         solver = StaticSolver(small_mesh, single_ply_laminate)
-        bcs = solver._load_state_to_bcs(LoadState(Nx=100.0))
-        fx, fy, fz = _force_components(small_mesh, bcs)
-        assert fx == pytest.approx(100.0 * Ly)
-        assert fy == pytest.approx(0.0)
-        assert fz == pytest.approx(0.0)
-
-    def test_nxy_total_force_matches_resultant(self, small_mesh,
-                                               single_ply_laminate):
-        Lx, Ly, Lz = small_mesh.domain_size
-        solver = StaticSolver(small_mesh, single_ply_laminate)
-        bcs = solver._load_state_to_bcs(LoadState(Nxy=30.0))
-        fx, fy, fz = _force_components(small_mesh, bcs)
-        assert fy == pytest.approx(30.0 * Ly)
-        assert fx == pytest.approx(0.0)
-
-    def test_zero_load_only_clamps_xmin(self, small_mesh,
-                                        single_ply_laminate):
-        """No mechanical load -> only the x_min clamp, no applied force."""
-        solver = StaticSolver(small_mesh, single_ply_laminate)
-        bcs = solver._load_state_to_bcs(LoadState())
-        assert _bc_kinds(bcs) == ["fixed"]
-        # x_min clamp is supplied as an explicit node_ids list (not a
-        # face= BC) covering every x_min node in all 3 DOFs.
-        assert bcs[0].face is None
-        assert bcs[0].node_ids is not None
-        assert sorted(bcs[0].node_ids.tolist()) == sorted(
-            small_mesh.nodes_on_face("x_min").tolist()
-        )
-        assert sorted(bcs[0].dofs) == [0, 1, 2]
-        fx, fy, fz = _force_components(small_mesh, bcs)
-        assert (fx, fy, fz) == (0.0, 0.0, 0.0)
-
-    def test_applied_force_agrees_with_boundaryhandler(self, small_mesh,
-                                                       single_ply_laminate):
-        """Parity guard (#96): the two converters must produce the SAME
-        applied force vector for the same LoadState, even though they
-        differ in rigid-body constraint structure."""
         handler = BoundaryHandler(small_mesh)
+        ss = solver._load_state_to_bcs(load)
+        bh = BoundaryHandler.load_state_to_bcs(load, small_mesh)
+        assert handler.get_constrained_dofs(ss) == handler.get_constrained_dofs(bh)
+        np.testing.assert_allclose(
+            handler.get_force_dofs(ss), handler.get_force_dofs(bh),
+            rtol=1e-12, atol=1e-12,
+        )
+
+    def test_ny_is_no_longer_silently_dropped(self, small_mesh,
+                                              single_ply_laminate):
+        """The regression that motivated removing the duplicate."""
+        Lx, Ly, _ = small_mesh.domain_size
         solver = StaticSolver(small_mesh, single_ply_laminate)
-        ls = LoadState(Nx=100.0, Nxy=30.0)
-        f_bh = handler.get_force_dofs(
-            BoundaryHandler.load_state_to_bcs(ls, small_mesh))
-        f_ss = handler.get_force_dofs(solver._load_state_to_bcs(ls))
-        np.testing.assert_allclose(f_bh, f_ss, rtol=1e-12, atol=1e-12)
+        bcs = solver._load_state_to_bcs(LoadState(Ny=50.0))
+        assert _face_force(small_mesh, bcs, "y_max", 1) == pytest.approx(
+            50.0 * Lx
+        )
 
-    def test_converters_diverge_on_rigidbody_constraints(self, small_mesh,
-                                                         single_ply_laminate):
-        """Pins the KNOWN structural divergence the issue calls out:
-        BoundaryHandler uses light symmetry + corner fix on x_min, while
-        StaticSolver fully clamps the entire x_min face (ux=uy=uz=0).
-        Equal applied force, different constraints -> different solves."""
+    def test_zero_load_gives_no_bcs(self, small_mesh, single_ply_laminate):
         solver = StaticSolver(small_mesh, single_ply_laminate)
-        ls = LoadState(Nx=100.0)
-
-        bh_bcs = BoundaryHandler.load_state_to_bcs(ls, small_mesh)
-        ss_bcs = solver._load_state_to_bcs(ls)
-
-        bh_constr = BoundaryHandler(small_mesh).get_constrained_dofs(bh_bcs)
-        ss_constr = BoundaryHandler(small_mesh).get_constrained_dofs(ss_bcs)
-
-        # StaticSolver clamps every x_min node in all 3 DOFs.
-        xmin = small_mesh.nodes_on_face("x_min")
-        for nid in xmin:
-            for d in (0, 1, 2):
-                assert 3 * int(nid) + d in ss_constr
-
-        # BoundaryHandler does NOT fully clamp x_min: an x_min node that
-        # is not the rigid-body corner is free in uy/uz.
-        corner = int(xmin[0])
-        non_corner = [int(n) for n in xmin if int(n) != corner]
-        assert non_corner, "fixture must have >1 node on x_min"
-        n0 = non_corner[0]
-        assert 3 * n0 + 0 in bh_constr      # ux fixed on x_min
-        assert 3 * n0 + 1 not in bh_constr  # uy free (not over-constrained)
-        assert 3 * n0 + 2 not in bh_constr  # uz free
-
-        # Therefore the two converters are NOT interchangeable for the
-        # constrained-DOF set even though their force vectors match.
-        assert ss_constr != bh_constr
-
-    def test_solve_load_state_uses_private_converter(self, small_mesh,
-                                                     single_ply_laminate):
-        """solve_load_state on a zero load still solves (clamp only) and
-        returns a finite, ~zero displacement field."""
-        solver = StaticSolver(small_mesh, single_ply_laminate)
-        results = solver.solve_load_state(LoadState(), solver="direct")
-        assert np.all(np.isfinite(results.displacement))
-        assert np.allclose(results.displacement, 0.0, atol=1e-9)
+        assert solver._load_state_to_bcs(LoadState()) == []

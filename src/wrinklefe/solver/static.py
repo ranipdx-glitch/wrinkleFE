@@ -541,6 +541,17 @@ class StaticSolver:
     def _load_state_to_bcs(self, load: LoadState) -> list:
         """Convert a CLT LoadState to 3-D boundary conditions.
 
+        Delegates to
+        :meth:`~wrinklefe.solver.boundary.BoundaryHandler.load_state_to_bcs`,
+        which is the single definition of this mapping.
+
+        This method used to carry its own, divergent implementation: it
+        clamped the whole ``x_min`` face in all three DOFs (over-restraining
+        the Poisson contraction) and read only ``Nx`` and ``Nxy``, so a
+        state carrying ``Ny``, ``Mx`` or ``My`` was solved as though those
+        components were zero — silently. One implementation removes both
+        problems at once.
+
         Parameters
         ----------
         load : LoadState
@@ -549,58 +560,12 @@ class StaticSolver:
         Returns
         -------
         list[BoundaryCondition]
-            List of BCs suitable for ``self.solve()``.
+            List of BCs suitable for :meth:`solve`.
         """
-        from wrinklefe.solver.boundary import BoundaryCondition
+        from wrinklefe.solver.boundary import BoundaryHandler
 
-        bcs: list[BoundaryCondition] = []
+        return BoundaryHandler.load_state_to_bcs(load, self.mesh)
 
-        # Clamp x_min face: ux = uy = uz = 0
-        x_min_nodes = self.mesh.nodes_on_face("x_min")
-        bcs.append(
-            BoundaryCondition(
-                bc_type="fixed",
-                node_ids=x_min_nodes,
-                dofs=[0, 1, 2],
-                value=0.0,
-            )
-        )
-
-        # Apply traction on x_max face from Nx via a pressure BC so the
-        # total face force is distributed by consistent face integration
-        # (see boundary.BoundaryHandler.get_force_dofs and issue #50).
-        # CLT Nx has units of force per unit width (N/mm), so the total
-        # nodal force across the face is Nx * Ly.
-        _, Ly, Lz = self.mesh.domain_size
-        x_max_has_elements = self.mesh.nx > 0 and self.mesh.ny > 0 and self.mesh.nz > 0
-
-        if x_max_has_elements and not np.isclose(load.Nx, 0.0):
-            total_force_x = load.Nx * Ly
-            bcs.append(
-                BoundaryCondition(
-                    bc_type="pressure",
-                    face="x_max",
-                    dofs=[0],
-                    value=total_force_x,
-                )
-            )
-
-        if x_max_has_elements and not np.isclose(load.Nxy, 0.0):
-            total_force_y = load.Nxy * Ly
-            bcs.append(
-                BoundaryCondition(
-                    bc_type="pressure",
-                    face="x_max",
-                    dofs=[1],
-                    value=total_force_y,
-                )
-            )
-
-        return bcs
-
-    # ------------------------------------------------------------------
-    # Post-processing
-    # ------------------------------------------------------------------
 
     # Cached (gp_coords, N_gp, dN_dxi_gp) for the standard hex8 / 2x2x2
     # quadrature.  Populated lazily by :meth:`_hex8_gauss_shape_functions`

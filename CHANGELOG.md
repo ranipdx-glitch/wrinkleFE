@@ -15,6 +15,47 @@ version produced a given file.
 ## [Unreleased]
 
 ### Fixed
+- Solver — **the CLT `LoadState` → 3-D boundary-condition mapping produced
+  the wrong strain state for anything involving in-plane shear** (found
+  while scoping issue #275, whose premise was that this conversion was
+  already sound).
+
+  `BoundaryHandler.load_state_to_bcs` built its BCs one resultant at a
+  time, and each block loaded only the "far" face while clamping or
+  symmetry-fixing the opposite one. That turns a *uniform* membrane state
+  into a cantilever reaction. Two consequences, measured against the
+  closed-form CLT solution on a flat `[0/45/-45/90]s` laminate:
+  - **Pure `Nxy` came out 37 % high** (γ_xy 1.117e-2 vs CLT 8.130e-3),
+    because shear was applied on the x-faces only. Uniform shear needs the
+    *complementary* pair — traction on the y-faces as well.
+  - **`Nx + Nxy` came out with the wrong sign** on the shear strain
+    (−1.401e-3 vs CLT +8.130e-3), because the `Nx` block adds a
+    `symmetry_y` plane on `y_min` that restrains precisely the deformation
+    the shear traction is trying to produce.
+
+  Membrane states are now applied as **self-equilibrated tractions on all
+  four in-plane faces**, with rigid-body motion removed at three points
+  rather than by fixing a face. Every membrane combination now reproduces
+  `Laminate.midplane_strains`: uniaxial 0.4 %, biaxial 0.3 %, pure shear
+  **0.4 %**, compression+shear **0.2 %**, full state 0.7 %.
+
+  Uniaxial `Nx` and biaxial `Nx + Ny` were **already correct** and are
+  unchanged — a face fix is a legitimate symmetry plane for those states.
+  Nothing in the analysis pipeline reaches this mapping (it uses
+  `compression_bcs`), so no knockdown, retention or validation-ledger
+  number moves; `python scripts/validate.py` shows zero drift.
+- Solver — **`StaticSolver._load_state_to_bcs` was a second, divergent
+  implementation of the same mapping** (the "two parallel converters" of
+  issue #96). It clamped the entire `x_min` face in all three DOFs,
+  over-restraining the Poisson contraction, and read only `Nx` and `Nxy` —
+  so `solve_load_state` on a state carrying `Ny`, `Mx` or `My` silently
+  solved as though those components were zero. It now delegates to the
+  single definition.
+- Solver — **combining membrane (`Nx`/`Ny`/`Nxy`) and curvature
+  (`Mx`/`My`) resultants is now refused** instead of silently superposed.
+  The curvature terms prescribe displacement on the same faces the membrane
+  terms load with traction, so the combined BC set described neither load.
+  The error names both groups and suggests separate runs.
 - Solver — **FE local-frame stress and strain were transformed with the
   wrong matrix and in the wrong order** (found by audit).
   `StaticSolver.recover_element_results` built one transform,
