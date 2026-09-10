@@ -420,6 +420,20 @@ INTENTIONALLY_UNEXPORTED = {
         "actionable tuning hint; emitted only on a non-converged CZM solve, "
         "absent for valid runs (#262)"
     ),
+    "load_state_factor": (
+        "proportional load factor under a general load state; "
+        "results_to_dict emits it only when AnalysisConfig.load_state was "
+        "set, so it is absent for every applied_strain run (keeps the "
+        "export byte-identical / ledger zero-drift, #275)"
+    ),
+    "load_state_factor_pristine": (
+        "flat-baseline load factor; emitted only alongside load_state_factor "
+        "(#275)"
+    ),
+    "load_state_factor_knockdown": (
+        "load_factor / load_state_factor_pristine; emitted only alongside "
+        "load_factor (#275)"
+    ),
     "mesh": "heavy MeshData; summarised as the top-level 'mesh' block when present",
     "wrinkle_config": "WrinkleConfiguration object; geometry captured under config",
     "laminate": "Laminate object; layup captured under config.angles",

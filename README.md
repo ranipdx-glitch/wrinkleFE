@@ -297,6 +297,51 @@ strain-independent reaction offset from a residual load is not a
 stiffness change, and folding it in would report a spurious modulus
 shift.
 
+### Combined load states — biaxial and in-plane shear
+
+Real wrinkle dispositions are rarely pure uniaxial: skin panels see
+compression **plus shear**, pressure shells see biaxial membrane states.
+`AnalysisConfig.load_state` takes a `LoadState` and applies its membrane
+resultants directly (issue #275):
+
+```python
+from wrinklefe.core.laminate import LoadState
+
+config = AnalysisConfig(
+    amplitude=0.15, wavelength=12.0, width=8.0, morphology="graded",
+    angles=[0, 45, -45, 90, 90, -45, 45, 0], ply_thickness=0.125,
+    load_state=LoadState(Nx=-800.0, Nxy=250.0),   # compression + shear
+)
+result = WrinkleAnalysis(config).run()
+print(result.load_state_factor)             # scale to first failure
+print(result.load_state_factor_knockdown)   # vs the flat baseline
+```
+
+This matters because the transverse and shear components a combined state
+produces are what drive the **matrix** failure modes — the cases where the
+FE path earns its cost over the analytical one, and exactly what a
+uniaxial-only surface could not express.
+
+**Strength under a combined load** is a *proportional load factor*: the
+scalar the whole state is multiplied by to reach first failure. Scaling
+the state as a whole is what "how much of this load can it take" means
+when the load is not a single number, and it reduces to the usual
+definition for a uniaxial state. `load_state_factor_knockdown` is the
+ratio to the flat baseline solved under the identical state, so it is a
+like-for-like knockdown and is invariant to how hard you push.
+
+`load_state=None` (the default) leaves the `applied_strain` path
+bit-identical.
+
+**Membrane components only.** `Mx`/`My`/`Mxy` are rejected: the boundary
+mapping applies curvature as a prescribed displacement on the same faces a
+membrane state loads with traction, so the two cannot be superposed.
+`Qx`/`Qy` have no mapping. A load state is also refused with
+`analytical_only=True`, `enable_czm`, or `enable_progressive_damage` —
+each builds its own uniaxial boundary conditions, so the state would be
+silently ignored. Set the temperature on `AnalysisConfig.delta_T`, not on
+the load state: one quantity, one owner.
+
 Moisture (`LoadState.delta_C`, and the `beta1/2/3` swelling coefficients
 on every material preset) is deliberately **not** exposed on
 `AnalysisConfig` yet: nothing in the CLT solve consumes `delta_C`, so a
