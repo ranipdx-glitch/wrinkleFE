@@ -14,6 +14,51 @@ version produced a given file.
 
 ## [Unreleased]
 
+### Added
+- Analysis — **general load states are reachable from `AnalysisConfig`**
+  (issue #275). `AnalysisConfig.load_state` takes a `LoadState` and
+  applies its membrane resultants directly, so **biaxial (`Ny`) and
+  in-plane shear (`Nxy`)** states are expressible for the first time.
+  The uniaxial-only surface understated exactly the cases where the FE
+  path earns its cost: the transverse and shear components a combined
+  state produces are what drive the matrix failure modes. Measured on a
+  wrinkled `[0/45/-45/90]s` coupon, adding `Nxy = 250` to `Nx = -800`
+  raises the mean ply shear stress by ~50 %, and `Ny = -400` raises the
+  mean transverse compression by ~50 % — neither reachable before.
+
+  **Strength under a combined state** is reported as a *proportional load
+  factor*: `AnalysisResults.load_state_factor` is the scalar the whole
+  state is multiplied by to reach first failure, with
+  `load_state_factor_pristine` for the flat baseline and
+  `load_state_factor_knockdown` for the ratio. Scaling the whole state is
+  what "how much of this load can it take" means when the load is not a
+  single number, and it reduces to the usual definition for a uniaxial
+  state. Because the solve is linear the search scales the *stored*
+  stress field rather than re-solving — verified by the property that
+  halving the load exactly doubles the factor (0.4947 → 0.9894), and that
+  the knockdown is invariant to load magnitude (0.9728 either way).
+
+  `load_state=None` (the default) leaves the `applied_strain` path
+  **bit-identical**; the load factors are computed and exported only when
+  a load state is set, so `validate.py` shows zero ledger drift.
+
+  **Scope, and what is refused rather than silently dropped.** Membrane
+  components only: `Mx`/`My`/`Mxy` are rejected because the BC mapping
+  applies curvature as a prescribed displacement on the same faces a
+  membrane state loads with traction, so the two cannot be superposed;
+  `Qx`/`Qy` have no mapping at all. A load state is also refused with
+  `analytical_only=True` (the closed-form knockdown is uniaxial), with
+  `enable_czm` and with `enable_progressive_damage` (both build their own
+  uniaxial boundary conditions). `load_state.delta_T` must be zero —
+  temperature is owned by `AnalysisConfig.delta_T`, because two places to
+  set one quantity is how a sign error gets in. Every message names the
+  offending component.
+
+  Note the result-field naming: `load_factor` was already taken in this
+  package for the **CLT first-ply-failure** factor (`1 / FI`), a
+  different quantity on a different path that still owns the plain
+  `load_factor` export key. The new fields are named for what they scale.
+
 ### Fixed
 - Solver — **the CLT `LoadState` → 3-D boundary-condition mapping produced
   the wrong strain state for anything involving in-plane shear** (found

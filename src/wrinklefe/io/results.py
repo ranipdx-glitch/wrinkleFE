@@ -258,6 +258,16 @@ def _knockdown_factors(results: AnalysisResults) -> dict:
         out["modulus_retention_failed"] = True
     if results.modulus_retention_global_failed:
         out["modulus_retention_global_failed"] = True
+    # Proportional load factor under a general load state (issue #275).
+    # Emitted only when AnalysisConfig.load_state was set — absent (and
+    # byte-identical) for every applied_strain run, preserving ledger
+    # zero-drift.
+    if results.load_state_factor is not None:
+        out["load_state_factor"] = _f(results.load_state_factor)
+    if results.load_state_factor_pristine is not None:
+        out["load_state_factor_pristine"] = _f(results.load_state_factor_pristine)
+    if results.load_state_factor_knockdown is not None:
+        out["load_state_factor_knockdown"] = _f(results.load_state_factor_knockdown)
     # CZM/Newton convergence-failure diagnostics — present only on a
     # non-converged nonlinear solve (both None when converged), so they are
     # absent and byte-identical for valid runs, preserving ledger zero-drift.

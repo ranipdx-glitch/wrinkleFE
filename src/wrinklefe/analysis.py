@@ -1115,6 +1115,32 @@ class AnalysisConfig:
         ``delta_T = 0`` because a thermal offset in the reaction force
         would corrupt a stiffness measurement.  Must be finite with
         ``|delta_T| <= 1000``.
+    load_state : LoadState or None
+        General CLT load state (issue #275).  ``None`` (default) keeps
+        the legacy ``loading`` / ``applied_strain`` pair as the entire
+        load vocabulary and leaves every result bit-identical.
+
+        When set, its resultants define the FE mechanical load directly,
+        so biaxial (``Ny``) and in-plane-shear (``Nxy``) states become
+        reachable — the states whose transverse and shear components
+        drive the matrix failure modes, and which a uniaxial-only surface
+        cannot express.  ``applied_strain`` then no longer sets the FE
+        boundary conditions; it still drives the separate uniaxial probe
+        that measures modulus retention, which is a stiffness property
+        and deliberately load-state-independent.
+
+        **Membrane components only.**  ``Mx``/``My``/``Mxy`` are
+        rejected: the BC mapping applies curvature as a prescribed
+        displacement on the same faces a membrane state loads with
+        traction, so the two cannot be superposed.  ``Qx``/``Qy`` have no
+        mapping at all.  ``delta_T`` must be zero on the load state — set
+        the temperature on :attr:`delta_T` instead, so one quantity has
+        one owner.
+
+        Strength under a combined state is reported as a **proportional
+        load factor** (:attr:`AnalysisResults.load_state_factor`): the scalar
+        the whole state is multiplied by to reach first failure.  That
+        reduces to the usual definition for a uniaxial state.
     solver : str
         Linear solver: ``'direct'`` or ``'iterative'``.  Default ``'direct'``.
     iterative_rtol : float
@@ -1249,11 +1275,26 @@ class AnalysisConfig:
     # from cure is therefore NEGATIVE — a 177 C cure taken to 22 C is
     # ``delta_T = -155``.  Default 0.0 leaves every result bit-identical.
     #
-    # Consumed by the CLT path (``Laminate.thermal_resultants`` ->
-    # ``midplane_strains`` -> ply stress recovery).  The FE path has no
-    # initial-strain load vector yet (Stage 2), so a non-zero value is
-    # rejected there instead of being silently ignored — see ``_validate``.
+    # Consumed by both paths since #273 Stage 2: the CLT path through
+    # ``Laminate.thermal_resultants`` -> ``midplane_strains`` -> ply
+    # stress recovery, and the FE path through the element thermal
+    # initial-strain load vector ``int B^T C eps_th dV``.
     delta_T: float = 0.0
+
+    # General load state (issue #275).  ``None`` (default) keeps the
+    # legacy ``loading`` / ``applied_strain`` pair as the whole load
+    # vocabulary and leaves every result bit-identical.  When set, the
+    # CLT resultants it carries define the FE mechanical load directly
+    # (via ``BoundaryHandler.load_state_to_bcs``), which is the only way
+    # to reach biaxial and in-plane-shear states — exactly the ones whose
+    # transverse/shear components drive the matrix failure modes.
+    #
+    # Membrane components only for now: ``Mx``/``My`` are rejected
+    # because the BC mapping cannot superpose a prescribed-displacement
+    # curvature with membrane tractions, and ``Qx``/``Qy`` have no
+    # mapping at all.  ``delta_T`` stays on this config rather than on
+    # the load state, so temperature has exactly one owner.
+    load_state: LoadState | None = None
 
     # Solver
     solver: str = "direct"
@@ -1768,6 +1809,90 @@ class AnalysisConfig:
                 f"(cure) state, not an absolute temperature: a 177 C cure "
                 f"taken to 22 C service is delta_T = -155, not -273 or 22."
             )
+        # --- General load state (issue #275) --------------------------
+        if self.load_state is not None:
+            ls = self.load_state
+            if not isinstance(ls, LoadState):
+                raise ValueError(
+                    "AnalysisConfig.load_state must be a LoadState or None, "
+                    f"got {type(ls).__name__}."
+                )
+            for name in ("Nx", "Ny", "Nxy", "Mx", "My", "Mxy",
+                         "Qx", "Qy", "delta_T", "delta_C"):
+                value = float(getattr(ls, name))
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f"AnalysisConfig.load_state.{name} must be finite, "
+                        f"got {value}."
+                    )
+            # Membrane-only: the BC mapping refuses to superpose a
+            # prescribed-displacement curvature with membrane tractions
+            # (they act on the same faces), and Qx/Qy have no mapping.
+            for name in ("Mx", "My", "Mxy"):
+                if float(getattr(ls, name)) != 0.0:
+                    raise ValueError(
+                        f"AnalysisConfig.load_state.{name}="
+                        f"{getattr(ls, name)} is not supported yet: "
+                        "curvature resultants are applied as prescribed "
+                        "displacements on the same faces a membrane state "
+                        "loads with traction, so the two cannot be "
+                        "superposed (issue #275). Use a membrane-only "
+                        "state (Nx/Ny/Nxy)."
+                    )
+            for name in ("Qx", "Qy"):
+                if float(getattr(ls, name)) != 0.0:
+                    raise ValueError(
+                        f"AnalysisConfig.load_state.{name}="
+                        f"{getattr(ls, name)} is not supported: transverse "
+                        "shear resultants have no 3-D boundary-condition "
+                        "mapping. Use a membrane-only state (Nx/Ny/Nxy)."
+                    )
+            if not any(abs(float(getattr(ls, n))) > 0.0
+                       for n in ("Nx", "Ny", "Nxy")):
+                raise ValueError(
+                    "AnalysisConfig.load_state carries no membrane "
+                    "resultant (Nx, Ny and Nxy are all zero), which maps "
+                    "to an empty boundary-condition set and a singular "
+                    "system. Set at least one, or leave load_state=None "
+                    "to use the applied_strain path."
+                )
+            # One owner per quantity: temperature lives on the config.
+            for name in ("delta_T", "delta_C"):
+                if float(getattr(ls, name)) != 0.0:
+                    raise ValueError(
+                        f"AnalysisConfig.load_state.{name}="
+                        f"{getattr(ls, name)} must be zero. Environmental "
+                        "loading is owned by the config, not the load "
+                        "state: set AnalysisConfig.delta_T instead (a "
+                        "second place to set the same quantity is how "
+                        "sign errors get in). Moisture is not exposed at "
+                        "all - nothing in the solve consumes delta_C."
+                    )
+            # FE-only: the closed-form analytical knockdown is uniaxial.
+            if self.analytical_only:
+                raise ValueError(
+                    "AnalysisConfig.load_state requires the FE path but "
+                    "analytical_only=True. The closed-form knockdown is "
+                    "defined for a uniaxial state only; a general load "
+                    "state is applied through 3-D boundary conditions. "
+                    "Set analytical_only=False or load_state=None."
+                )
+            if self.enable_czm:
+                raise ValueError(
+                    "AnalysisConfig.load_state is not yet combinable with "
+                    "enable_czm: the CZM path builds its own uniaxial "
+                    "compression boundary conditions, so the load state "
+                    "would be silently ignored (issue #275)."
+                )
+            if self.enable_progressive_damage:
+                raise ValueError(
+                    "AnalysisConfig.load_state is not yet combinable with "
+                    "enable_progressive_damage: that solver ramps a "
+                    "prescribed displacement to ultimate load, and a "
+                    "force-controlled load state has no applied_strain to "
+                    "ramp (issue #275)."
+                )
+
         # --- Wrinkle placement (interface indices) --------------------
         n_plies = len(self.angles)
         for name in ("interface_1", "interface_2"):
@@ -2367,6 +2492,8 @@ class AnalysisConfig:
                 out[f.name] = (
                     None if value is None else [asdict(s) for s in value]
                 )
+            elif f.name == "load_state":
+                out[f.name] = None if value is None else asdict(value)
             elif f.name == "penetration_gate":
                 out[f.name] = _gate_to_jsonable(value)
             elif f.name == "angles":
@@ -2427,6 +2554,22 @@ class AnalysisConfig:
         for mkey in ("material", "resin_pocket_material"):
             if mkey in kwargs:
                 kwargs[mkey] = _material_from_jsonable(kwargs[mkey], field=mkey)
+        if kwargs.get("load_state") is not None:
+            raw = kwargs["load_state"]
+            if not isinstance(raw, dict):
+                raise ValueError(
+                    "AnalysisConfig.from_dict: load_state must be null or "
+                    f"an object, got {type(raw).__name__}"
+                )
+            valid_ls = {f.name for f in fields(LoadState)}
+            unknown_ls = set(raw) - valid_ls
+            if unknown_ls:
+                raise ValueError(
+                    f"AnalysisConfig.from_dict: unknown load_state key(s) "
+                    f"{sorted(unknown_ls)}; valid fields are "
+                    f"{sorted(valid_ls)}"
+                )
+            kwargs["load_state"] = LoadState(**raw)
         if kwargs.get("wrinkles") is not None:
             specs = kwargs["wrinkles"]
             if not isinstance(specs, list):
@@ -2603,6 +2746,37 @@ class AnalysisResults:
     # Retention factor (wrinkled / pristine)
     retention_factors: dict | None = None  # {criterion_name: float}
     baseline_fi: dict | None = None  # {criterion_name: float} pristine max FI
+
+    # Proportional load factor (issue #275).  Populated only when
+    # ``AnalysisConfig.load_state`` is set — the general-load-state
+    # answer to "how much strength is left".
+    load_state_factor: float | None = None
+    """Scalar the whole :attr:`AnalysisConfig.load_state` is multiplied by
+    to reach first failure on the **wrinkled** coupon: ``max FI(lambda
+    sigma) = 1``.  ``lambda > 1`` means the applied state is survivable
+    with that much margin; ``lambda < 1`` means it already fails.
+
+    This is the combined-load generalisation of a strength: scaling the
+    whole state proportionally is what "how much of this load can it
+    take" means when the load is not a single number.  For a uniaxial
+    state it reduces to the usual definition.  ``None`` when no load
+    state was given, or when the root could not be bracketed.
+
+    NOTE the name: ``load_factor`` alone is already taken in this package
+    for the **CLT first-ply-failure** factor (``1 / FI``, see
+    ``failure/evaluator.py`` and the top-level ``load_factor`` key of
+    ``results_to_dict``).  That is a different quantity computed on a
+    different path, so this one is named for what it scales.  Do not
+    shorten it back."""
+
+    load_state_factor_pristine: float | None = None
+    """The same factor for the flat (no-wrinkle) baseline, solved under
+    the identical load state."""
+
+    load_state_factor_knockdown: float | None = None
+    """``load_factor / load_state_factor_pristine`` — the strength knockdown
+    under the general load state.  Reduces to the uniaxial strength
+    knockdown when the state is uniaxial."""
 
     # Modulus retention (E_wrinkled / E_pristine from FE)
     modulus_retention_failed: bool = False
@@ -2883,6 +3057,96 @@ def _iterative_solver_kwargs(cfg: AnalysisConfig) -> dict:
         "ilu_fill_factor": cfg.ilu_fill_factor,
         "preconditioner": cfg.preconditioner,
     }
+
+
+def _mechanical_bcs(cfg: AnalysisConfig, mesh: MeshData) -> list:
+    """Boundary conditions for the mechanical load the config asks for.
+
+    ``AnalysisConfig.load_state`` (issue #275), when set, is the whole
+    mechanical load: its resultants become the self-equilibrated traction
+    set of
+    :meth:`~wrinklefe.solver.boundary.BoundaryHandler.load_state_to_bcs`.
+    Otherwise the legacy uniaxial displacement BCs from
+    ``applied_strain`` are used, unchanged and bit-identical.
+
+    Shared by the wrinkled run and its pristine retention baseline so the
+    two are always solved under the same load.
+    """
+    if cfg.load_state is not None:
+        return BoundaryHandler.load_state_to_bcs(cfg.load_state, mesh)
+    return BoundaryHandler.compression_bcs(
+        mesh, applied_strain=cfg.applied_strain
+    )
+
+
+def _proportional_load_factor(
+    max_fi_at: Callable[[float], float],
+    *,
+    max_factor: float = 1.0e6,
+    min_factor: float = 1.0e-9,
+) -> float | None:
+    """Scalar the whole load state is multiplied by to reach first failure.
+
+    Solves ``max FI(lambda * sigma) = 1`` for ``lambda`` (issue #275).
+    Because the FE solve is linear the stress field is linear in
+    ``lambda``, so the search scales the *stored* field instead of
+    re-solving — a root-find over a handful of vectorised criterion
+    evaluations.
+
+    .. warning::
+       Linearity is what makes scaling valid.  With a thermal load the
+       field is *affine* (``sigma = lambda sigma_mech + sigma_th``), and
+       this would be wrong.  ``AnalysisConfig`` rejects ``delta_T``
+       alongside ``load_state`` for exactly that reason; if that guard is
+       ever relaxed, this routine must split the two contributions first.
+
+    For a uniaxial state this reduces to the usual strength definition:
+    the load is scaled until the coupon first fails.
+
+    Parameters
+    ----------
+    max_fi_at : callable
+        ``lambda -> max failure index`` over the field and all criteria.
+    max_factor, min_factor : float
+        Bracket limits.  ``None`` is returned when no root lies inside
+        them (an unloaded field, or one that cannot be driven to failure).
+
+    Returns
+    -------
+    float or None
+        The critical load factor, or ``None`` if it could not be bracketed.
+    """
+    from scipy.optimize import brentq
+
+    def residual(lam: float) -> float:
+        return float(max_fi_at(lam)) - 1.0
+
+    fi_unit = max_fi_at(1.0)
+    if not math.isfinite(fi_unit) or fi_unit <= 0.0:
+        return None
+
+    if residual(1.0) > 0.0:
+        # Already past first failure at the applied load: lambda < 1.
+        hi = 1.0
+        lo = 0.5
+        while lo > min_factor and residual(lo) > 0.0:
+            hi = lo
+            lo *= 0.5
+        if residual(lo) > 0.0:
+            return None
+    else:
+        lo = 1.0
+        hi = 2.0
+        while hi < max_factor and residual(hi) < 0.0:
+            lo = hi
+            hi *= 2.0
+        if residual(hi) < 0.0:
+            return None
+
+    try:
+        return float(brentq(residual, lo, hi, rtol=1.0e-6))
+    except (ValueError, RuntimeError):
+        return None
 
 
 def _sweep_run_one(
@@ -3278,9 +3542,9 @@ class WrinkleAnalysis:
             mesh, laminate, delta_T=cfg.delta_T,
             **_iterative_solver_kwargs(cfg)
         )
-        bcs = BoundaryHandler.compression_bcs(
-            mesh, applied_strain=cfg.applied_strain
-        )
+        # A general load state (issue #275) replaces the uniaxial
+        # displacement BCs with the traction set its resultants define.
+        bcs = _mechanical_bcs(cfg, mesh)
         field_results = solver.solve(
             bcs, solver=cfg.solver, verbose=cfg.verbose
         )
@@ -4942,6 +5206,37 @@ class WrinkleAnalysis:
         mesh: MeshData,
     ) -> None:
         """Evaluate failure criteria on the FE stress field."""
+        evaluator, materials, eval_ply_ids, elem_fiber_angles = (
+            self._failure_eval_inputs(laminate, mesh)
+        )
+
+        # Field-level evaluation
+        fi_fields, mode_fields = evaluator.evaluate_field(
+            field_results.stress_local,
+            materials,
+            eval_ply_ids,
+            fiber_angles=elem_fiber_angles,
+        )
+        results.failure_indices = fi_fields
+        results.failure_modes = mode_fields
+
+        # CLT-level evaluation at applied load
+        self._evaluate_clt_failure(results, laminate)
+
+    def _failure_eval_inputs(
+        self,
+        laminate: Laminate,
+        mesh: MeshData,
+    ) -> tuple[FailureEvaluator, list, np.ndarray, np.ndarray]:
+        """Resolve the per-element inputs the failure criteria need.
+
+        Returns ``(evaluator, materials, eval_ply_ids, fiber_angles)``.
+        Shared by :meth:`_evaluate_failure` and the proportional
+        load-factor search (issue #275) so both evaluate the field
+        through exactly the same material routing and misalignment
+        scaling — a second copy of this resolution is how the two would
+        drift apart.
+        """
         evaluator = FailureEvaluator.default_criteria()
 
         # Build material list for each ply
@@ -4979,18 +5274,7 @@ class WrinkleAnalysis:
                 mesh.resin_mask, 0.0, elem_fiber_angles
             )
 
-        # Field-level evaluation
-        fi_fields, mode_fields = evaluator.evaluate_field(
-            field_results.stress_local,
-            materials,
-            eval_ply_ids,
-            fiber_angles=elem_fiber_angles,
-        )
-        results.failure_indices = fi_fields
-        results.failure_modes = mode_fields
-
-        # CLT-level evaluation at applied load
-        self._evaluate_clt_failure(results, laminate)
+        return evaluator, materials, eval_ply_ids, elem_fiber_angles
 
     def _clt_load_state(self) -> LoadState:
         """Build the CLT :class:`LoadState` the pipeline evaluates.
@@ -5036,6 +5320,60 @@ class WrinkleAnalysis:
         except Exception as exc:
             logger.warning("CLT evaluation skipped: %s", exc)
 
+    def _compute_load_factors(
+        self,
+        results: AnalysisResults,
+        laminate: Laminate,
+        flat_field: FieldResults,
+        flat_mesh: MeshData,
+    ) -> None:
+        """Proportional load factors for the wrinkled coupon and baseline.
+
+        See :func:`_proportional_load_factor` for the definition and for
+        why scaling the stored field (rather than re-solving) is exact
+        here.  Both sides are scaled from fields solved under the *same*
+        load state, so the ratio is a like-for-like knockdown.
+        """
+        assert results.field_results is not None
+        wrinkled_mesh = results.mesh
+        if wrinkled_mesh is None:
+            return
+
+        w_eval, w_mats, w_ids, w_angles = self._failure_eval_inputs(
+            laminate, wrinkled_mesh,
+        )
+        p_eval = FailureEvaluator.default_criteria()
+        p_mats = [ply.material for ply in laminate.plies]
+
+        def _max_fi(evaluator, stress, materials, ply_ids, angles):
+            def at(lam: float) -> float:
+                fields, _modes = evaluator.evaluate_field(
+                    lam * stress, materials, ply_ids, fiber_angles=angles,
+                )
+                best = 0.0
+                for arr in fields.values():
+                    finite = np.asarray(arr)[np.isfinite(arr)]
+                    if finite.size:
+                        best = max(best, float(finite.max()))
+                return best
+            return at
+
+        results.load_state_factor = _proportional_load_factor(
+            _max_fi(w_eval, results.field_results.stress_local,
+                    w_mats, w_ids, w_angles)
+        )
+        results.load_state_factor_pristine = _proportional_load_factor(
+            _max_fi(p_eval, flat_field.stress_local,
+                    p_mats, flat_mesh.ply_ids, None)
+        )
+        if (
+            results.load_state_factor is not None
+            and results.load_state_factor_pristine
+        ):
+            results.load_state_factor_knockdown = (
+                results.load_state_factor / results.load_state_factor_pristine
+            )
+
     def _compute_retention_factors(
         self,
         results: AnalysisResults,
@@ -5058,15 +5396,14 @@ class WrinkleAnalysis:
         flat_mesh = self._build_flat_mesh(laminate)
 
         # Solve with same BCs
-        # Same thermal state as the wrinkled run so the retention factor
-        # compares like with like (issue #273 Stage 2).
+        # Same thermal state AND the same mechanical load state as the
+        # wrinkled run, so the retention factor compares like with like
+        # (issues #273 Stage 2 and #275).
         flat_solver = StaticSolver(
             flat_mesh, laminate, delta_T=cfg.delta_T,
             **_iterative_solver_kwargs(cfg)
         )
-        flat_bcs = BoundaryHandler.compression_bcs(
-            flat_mesh, applied_strain=cfg.applied_strain
-        )
+        flat_bcs = _mechanical_bcs(cfg, flat_mesh)
         flat_field = flat_solver.solve(flat_bcs, solver=cfg.solver, verbose=False)
 
         # Evaluate failure on flat mesh (no fiber misalignment)
@@ -5079,6 +5416,14 @@ class WrinkleAnalysis:
             flat_mesh.ply_ids,
             fiber_angles=None,  # no misalignment in pristine laminate
         )
+
+        # Proportional load factors under a general load state (#275).
+        # Done here because this is where the pristine field already
+        # exists, so the knockdown costs no extra solve.
+        if cfg.load_state is not None and results.field_results is not None:
+            self._compute_load_factors(
+                results, laminate, flat_field, flat_mesh,
+            )
 
         # Compute retention for each criterion
         retention = {}
