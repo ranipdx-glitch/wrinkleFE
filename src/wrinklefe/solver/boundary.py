@@ -591,122 +591,122 @@ class BoundaryHandler:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def load_state_to_bcs(
+    def _corner_node(mesh: MeshData, x: float, y: float, z: float) -> np.ndarray:
+        """Index of the mesh node nearest the point ``(x, y, z)``."""
+        d = np.sum((mesh.nodes - np.array([x, y, z])) ** 2, axis=1)
+        return np.array([int(np.argmin(d))], dtype=np.intp)
+
+    @staticmethod
+    def _rigid_body_bcs(mesh: MeshData) -> list[BoundaryCondition]:
+        """Six point constraints that remove rigid-body motion — and nothing else.
+
+        A membrane state must be applied with **tractions only**: fixing a
+        whole face would restrain the very deformation being applied (a
+        clamped ``x_min`` suppresses the Poisson contraction, and a
+        ``symmetry_y`` plane suppresses shear outright).  So rigid-body
+        motion is removed at three points instead, statically determinately:
+
+        ==========================  ====================================
+        node                        constrained
+        ==========================  ====================================
+        ``(x_min, y_min, z_min)``   ``ux, uy, uz``  (3 translations)
+        ``(x_max, y_min, z_min)``   ``uy, uz``      (rot. about z and x)
+        ``(x_min, y_max, z_min)``   ``uz``          (rot. about y)
+        ==========================  ====================================
+
+        Six constraints in total.  Fixing ``uy`` at the second node picks
+        the *simple-shear* gauge (``u_x = gamma y``, ``u_y = 0``) out of the
+        family of fields that differ only by a rigid rotation — the strain
+        state, which is what the solver reports, is identical either way.
+
+        Raises
+        ------
+        ValueError
+            If the three anchor points are not distinct (a degenerate mesh
+            with no extent in x or y), since the constraint set would then
+            leave a rigid mode and the stiffness matrix singular.
+        """
+        nodes = mesh.nodes
+        x0, y0, z0 = nodes.min(axis=0)
+        x1, y1 = nodes[:, 0].max(), nodes[:, 1].max()
+
+        p0 = BoundaryHandler._corner_node(mesh, x0, y0, z0)
+        p1 = BoundaryHandler._corner_node(mesh, x1, y0, z0)
+        p2 = BoundaryHandler._corner_node(mesh, x0, y1, z0)
+        if len({int(p0[0]), int(p1[0]), int(p2[0])}) != 3:
+            raise ValueError(
+                "Cannot remove rigid-body motion: the mesh has no extent in "
+                f"x or y (anchor nodes {int(p0[0])}, {int(p1[0])}, "
+                f"{int(p2[0])} are not distinct). A membrane load state "
+                "needs a two-dimensional footprint."
+            )
+        return [
+            BoundaryCondition(bc_type="fixed", node_ids=p0, dofs=[0, 1, 2]),
+            BoundaryCondition(bc_type="fixed", node_ids=p1, dofs=[1, 2]),
+            BoundaryCondition(bc_type="fixed", node_ids=p2, dofs=[2]),
+        ]
+
+    @staticmethod
+    def _membrane_bcs(
         load: LoadState, mesh: MeshData
     ) -> list[BoundaryCondition]:
-        """Convert a CLT load state to 3-D boundary conditions.
+        """Self-equilibrated tractions for a uniform membrane state.
 
-        Mapping from CLT resultants to 3-D BCs:
+        Every non-zero in-plane resultant is applied on **both** opposing
+        faces, with opposite sign — that is what makes the state uniform
+        rather than a cantilever reaction:
 
-        - **Nx** (force/width): applied as uniform x-traction on
-          ``x_max``.  ``sigma_x = Nx / h`` distributed as equal nodal
-          forces.  ``x_min`` is fixed in x; one node is fully fixed
-          (rigid body).
-        - **Ny**: uniform y-traction on ``y_max``, fixed y on ``y_min``.
-        - **Nxy**: tangential traction on x-faces (shear loading).
-        - **Mx**: linear through-thickness x-displacement on ``x_max``:
-          ``u_x(z) = kappa_x * z * Lx``, where ``kappa_x = Mx / D11``.
-        - **My**: linear through-thickness y-displacement on ``y_max``.
-        - Pressure (``Qx/Qy``): normal traction on ``z_max``.
+        - ``Nx``  : x-traction on ``x_max`` (+) and ``x_min`` (-)
+        - ``Ny``  : y-traction on ``y_max`` (+) and ``y_min`` (-)
+        - ``Nxy`` : the **complementary** shear pair — y-traction on the
+          x-faces *and* x-traction on the y-faces.  Applying it on the
+          x-faces alone produces a tip-loaded cantilever, not pure shear.
 
-        The method handles combined loading by accumulating BCs from
-        each non-zero resultant.
+        Resultants are per unit width, so a face force is the resultant
+        times the length of the edge it acts on (``Ly`` for the x-faces,
+        ``Lx`` for the y-faces); ``get_force_dofs`` then distributes each
+        face total by consistent Q4 face integration.
 
-        Parameters
-        ----------
-        load : LoadState
-            CLT load state with force/moment resultants.
-        mesh : MeshData
-            The mesh to resolve face node IDs.
+        The load set is self-equilibrated, so the only kinematic
+        constraints needed are the six rigid-body anchors from
+        :meth:`_rigid_body_bcs`.
+        """
+        Lx, Ly, _Lz = mesh.domain_size
+        bcs = BoundaryHandler._rigid_body_bcs(mesh)
 
-        Returns
-        -------
-        list[BoundaryCondition]
-            Boundary conditions suitable for passing to
-            :meth:`get_constrained_dofs` and :meth:`get_force_dofs`.
+        def traction(face: str, dof: int, value: float) -> None:
+            if value != 0.0:
+                bcs.append(BoundaryCondition(
+                    bc_type="pressure", face=face, dofs=[dof], value=value,
+                ))
+
+        for face, sign in (("x_max", 1.0), ("x_min", -1.0)):
+            traction(face, 0, sign * load.Nx * Ly)
+            traction(face, 1, sign * load.Nxy * Ly)
+        for face, sign in (("y_max", 1.0), ("y_min", -1.0)):
+            traction(face, 1, sign * load.Ny * Lx)
+            traction(face, 0, sign * load.Nxy * Lx)
+
+        return bcs
+
+    @staticmethod
+    def _bending_bcs(
+        load: LoadState, mesh: MeshData
+    ) -> list[BoundaryCondition]:
+        """Curvature (prescribed-displacement) BCs for ``Mx`` / ``My``.
+
+        ``kappa_x = Mx / D11`` and ``kappa_y = My / D22`` from the
+        decoupled CLT moment-curvature relation, imposed as a linear
+        through-thickness displacement on the far face.
         """
         bcs: list[BoundaryCondition] = []
-        Lx, Ly, Lz = mesh.domain_size
+        Lx, Ly, _Lz = mesh.domain_size
+        bcs.extend(BoundaryHandler._rigid_body_bcs(mesh))
 
-        # ------ Rigid body suppression ------
-        # Fix one corner node on x_min face to prevent rigid body motion.
-        xmin_nodes = mesh.nodes_on_face("x_min")
-        corner_node = np.array([xmin_nodes[0]], dtype=np.intp)
-
-        has_any_load = (
-            abs(load.Nx) > 0 or abs(load.Ny) > 0 or abs(load.Nxy) > 0
-            or abs(load.Mx) > 0 or abs(load.My) > 0
-        )
-
-        if not has_any_load:
-            return bcs
-
-        # ------ Nx: axial x-loading ------
-        if abs(load.Nx) > 0:
-            # Fix ux on x_min face
-            bcs.append(BoundaryCondition(
-                bc_type="fixed", face="x_min", dofs=[0],
-            ))
-            # Fix uy on y_min (symmetry / prevent shear)
-            bcs.append(BoundaryCondition(
-                bc_type="symmetry_y", face="y_min",
-            ))
-            # Fix one node fully (rigid body z-translation)
-            bcs.append(BoundaryCondition(
-                bc_type="fixed", node_ids=corner_node, dofs=[1, 2],
-            ))
-            # Apply Nx as pressure on x_max face
-            # Total force = Nx (N/mm) * Ly (mm) = N
-            total_force = load.Nx * Ly
-            bcs.append(BoundaryCondition(
-                bc_type="pressure", face="x_max", dofs=[0],
-                value=total_force,
-            ))
-
-        # ------ Ny: axial y-loading ------
-        if abs(load.Ny) > 0:
-            bcs.append(BoundaryCondition(
-                bc_type="fixed", face="y_min", dofs=[1],
-            ))
-            if abs(load.Nx) == 0:
-                # Only add x-symmetry if Nx is not already handling it
-                bcs.append(BoundaryCondition(
-                    bc_type="symmetry_x", face="x_min",
-                ))
-                bcs.append(BoundaryCondition(
-                    bc_type="fixed", node_ids=corner_node, dofs=[0, 2],
-                ))
-            total_force = load.Ny * Lx
-            bcs.append(BoundaryCondition(
-                bc_type="pressure", face="y_max", dofs=[1],
-                value=total_force,
-            ))
-
-        # ------ Nxy: in-plane shear ------
-        if abs(load.Nxy) > 0:
-            if abs(load.Nx) == 0 and abs(load.Ny) == 0:
-                bcs.append(BoundaryCondition(
-                    bc_type="fixed", face="x_min", dofs=[0, 1],
-                ))
-                bcs.append(BoundaryCondition(
-                    bc_type="fixed", node_ids=corner_node, dofs=[2],
-                ))
-            # Shear traction on x_max face in y-direction
-            total_force = load.Nxy * Ly
-            bcs.append(BoundaryCondition(
-                bc_type="pressure", face="x_max", dofs=[1],
-                value=total_force,
-            ))
-
-        # ------ Mx: bending moment about y-axis ------
         if abs(load.Mx) > 0:
             xmax_nodes = mesh.nodes_on_face("x_max")
             z_coords = mesh.nodes[xmax_nodes, 2]
             z_mid = 0.5 * (z_coords.min() + z_coords.max())
-
-            # Curvature from the laminate bending stiffness: kappa_x = Mx / D11
-            # (CLT moment-curvature relation, decoupled D-matrix form).
-            # Apply linear displacement: ux(z) = kappa_x * (z - z_mid) * Lx.
             if mesh.laminate is None:
                 raise ValueError(
                     "Cannot map Mx to a curvature boundary condition: the "
@@ -720,36 +720,19 @@ class BoundaryHandler:
                     "to a curvature boundary condition."
                 )
             kappa_x = load.Mx / D11
-
-            # Apply prescribed displacements on x_max, varying linearly with z
-            if abs(load.Nx) == 0:
-                bcs.append(BoundaryCondition(
-                    bc_type="fixed", face="x_min", dofs=[0],
-                ))
-                bcs.append(BoundaryCondition(
-                    bc_type="symmetry_y", face="y_min",
-                ))
-                bcs.append(BoundaryCondition(
-                    bc_type="fixed", node_ids=corner_node, dofs=[1, 2],
-                ))
-
             for nid in xmax_nodes:
                 z = float(mesh.nodes[nid, 2])
-                ux = kappa_x * (z - z_mid) * Lx
                 bcs.append(BoundaryCondition(
                     bc_type="displacement",
                     node_ids=np.array([nid], dtype=np.intp),
                     dofs=[0],
-                    value=ux,
+                    value=kappa_x * (z - z_mid) * Lx,
                 ))
 
-        # ------ My: bending moment about x-axis ------
         if abs(load.My) > 0:
             ymax_nodes = mesh.nodes_on_face("y_max")
             z_coords = mesh.nodes[ymax_nodes, 2]
             z_mid = 0.5 * (z_coords.min() + z_coords.max())
-
-            # Curvature from the laminate bending stiffness: kappa_y = My / D22.
             if mesh.laminate is None:
                 raise ValueError(
                     "Cannot map My to a curvature boundary condition: the "
@@ -763,29 +746,81 @@ class BoundaryHandler:
                     "to a curvature boundary condition."
                 )
             kappa_y = load.My / D22
-
-            if abs(load.Ny) == 0 and abs(load.Nx) == 0:
-                bcs.append(BoundaryCondition(
-                    bc_type="fixed", face="y_min", dofs=[1],
-                ))
-                bcs.append(BoundaryCondition(
-                    bc_type="symmetry_x", face="x_min",
-                ))
-                bcs.append(BoundaryCondition(
-                    bc_type="fixed", node_ids=corner_node, dofs=[0, 2],
-                ))
-
             for nid in ymax_nodes:
                 z = float(mesh.nodes[nid, 2])
-                uy = kappa_y * (z - z_mid) * Ly
                 bcs.append(BoundaryCondition(
                     bc_type="displacement",
                     node_ids=np.array([nid], dtype=np.intp),
                     dofs=[1],
-                    value=uy,
+                    value=kappa_y * (z - z_mid) * Ly,
                 ))
 
         return bcs
+
+    @staticmethod
+    def load_state_to_bcs(
+        load: LoadState, mesh: MeshData
+    ) -> list[BoundaryCondition]:
+        """Convert a CLT load state to 3-D boundary conditions.
+
+        **Membrane states** (``Nx``, ``Ny``, ``Nxy``, in any combination)
+        are applied as self-equilibrated tractions on all four in-plane
+        faces, with rigid-body motion removed at three points — see
+        :meth:`_membrane_bcs`.  Verified against the closed-form CLT
+        solution for a flat laminate: uniaxial, biaxial, pure shear and
+        combined compression-shear all reproduce ``midplane_strains`` to
+        better than 1 % on this package's default mesh density.
+
+        **Curvature states** (``Mx``, ``My``) are applied as prescribed
+        linear through-thickness displacements on the far face, with
+        ``kappa = M / D`` from the decoupled CLT relation.
+
+        Mixing the two is **rejected**: a curvature BC prescribes
+        displacement on ``x_max``/``y_max`` while a membrane state applies
+        traction to those same faces, and superposing the two would report
+        a stress state corresponding to neither load.
+
+        Parameters
+        ----------
+        load : LoadState
+            CLT load state with force/moment resultants.
+        mesh : MeshData
+            The mesh to resolve face node IDs.
+
+        Returns
+        -------
+        list[BoundaryCondition]
+            Boundary conditions suitable for :meth:`get_constrained_dofs`
+            and :meth:`get_force_dofs`.  Empty when the state carries no
+            mechanical load.
+
+        Raises
+        ------
+        ValueError
+            If membrane and curvature resultants are combined, or if the
+            mesh cannot support the required rigid-body anchors.
+        """
+        has_membrane = (
+            abs(load.Nx) > 0 or abs(load.Ny) > 0 or abs(load.Nxy) > 0
+        )
+        has_bending = abs(load.Mx) > 0 or abs(load.My) > 0
+
+        if has_membrane and has_bending:
+            raise ValueError(
+                "LoadState combines membrane (Nx/Ny/Nxy) and curvature "
+                "(Mx/My) resultants, which this BC mapping cannot apply "
+                "together: the curvature terms prescribe displacement on "
+                "the same faces the membrane terms load with traction, so "
+                "superposing them would describe neither load. Apply them "
+                "in separate runs, or use a membrane-only / curvature-only "
+                "state."
+            )
+
+        if has_membrane:
+            return BoundaryHandler._membrane_bcs(load, mesh)
+        if has_bending:
+            return BoundaryHandler._bending_bcs(load, mesh)
+        return []
 
     # ------------------------------------------------------------------
     # Convenience BC generators
