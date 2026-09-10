@@ -80,6 +80,22 @@ class TestMultiWrinkleFE:
         # Each wrinkle produces a local elevation above the far field.
         # (LaRC05 carries a uniform baseline FI under compression, so
         # the peaks are elevations on that baseline, not zero-to-one.)
+        #
+        # MARGIN, RE-PINNED: this threshold was 1.1, calibrated while
+        # ``recover_element_results`` composed the local-frame transform in
+        # the wrong order (ply and wrinkle factors reversed, and the stress
+        # matrix reused for engineering strain).  That defect inflated the
+        # in-wrinkle stresses of off-axis plies -- and this case is the
+        # worst one for it: a [0/45/-45/90]s layup with the wrinkle at the
+        # 90/90 interface, where the error peaked at ~8 %.  Measured on this
+        # exact config, the fix moves the peak/far ratios
+        #     1.1882 -> 1.0652   (x = 6 mm)
+        #     1.1740 -> 1.0722   (x = 22 mm)
+        # while the far-field baseline is unchanged to 5e-8 (those elements
+        # are pristine, so the transform order cannot touch them).  The
+        # elevation the test exists to detect is still unambiguous; only the
+        # inflated margin is gone.  1.05 keeps the assertion meaningful with
+        # room for mesh/solver noise.
         far = np.ones_like(x_c, dtype=bool)
         for center in centers:
             far &= np.abs(x_c - center) > 6.0
@@ -88,7 +104,7 @@ class TestMultiWrinkleFE:
         for center in centers:
             near = np.abs(x_c - center) < 4.0      # within lambda/2
             assert near.any()
-            assert fi[near].max() > 1.1 * fi[far].max(), (
+            assert fi[near].max() > 1.05 * fi[far].max(), (
                 f"expected a local FI peak near x={center:.1f} mm"
             )
             peaks.append(fi[near].max())

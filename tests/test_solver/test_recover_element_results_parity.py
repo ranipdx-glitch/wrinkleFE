@@ -82,12 +82,23 @@ def test_recover_element_results_local_matches_manual_transform(
 ):
     """Local stress/strain at a hand-picked GP matches a manual transform.
 
-    Builds the same ``T_total = T_wrinkle(phi_gp) @ T_ply(theta)``
-    transform inline, applies it to the global stress/strain, and checks
-    against ``recover_element_results``.  This catches any regression in
-    the per-element / per-GP transform construction.
+    Two things this pins that an earlier version of it got wrong:
+
+    * **Which matrix.** Stress rotates with ``T_sigma``; *engineering*
+      strain rotates with ``T_eps = R T_sigma R^-1``
+      (``R = diag(1,1,1,2,2,2)``).  Reusing ``T_sigma`` on a strain vector
+      mis-scales every shear component by two.
+    * **Which order.** ``C_bar = R_y(R_z(C))``, so
+      ``sigma_local = T_ply @ T_wrinkle @ sigma_global`` — the ply
+      transform on the LEFT, because the wrinkle rotation is the outer one
+      and is therefore the first undone.  The reversed order is invisible
+      on a 0 deg ply (``T_ply`` is the identity) and reaches ~8 % on the
+      90 deg plies of this laminate.
     """
-    from wrinklefe.core.transforms import stress_transformation_3d
+    from wrinklefe.core.transforms import (
+        strain_transformation_3d,
+        stress_transformation_3d,
+    )
     from wrinklefe.elements.hex8 import Hex8Element
 
     mesh, laminate = parity_mesh_and_laminate
@@ -108,6 +119,7 @@ def test_recover_element_results_local_matches_manual_transform(
     for e in sample_elems:
         ply_angle_rad = np.radians(float(mesh.ply_angles[e]))
         T_ply = stress_transformation_3d(ply_angle_rad, axis='z')
+        T_ply_eps = strain_transformation_3d(ply_angle_rad, axis='z')
 
         node_ids = mesh.elements[e]
         fiber_angles_local = mesh.fiber_angles[node_ids]
@@ -117,10 +129,14 @@ def test_recover_element_results_local_matches_manual_transform(
             N = Hex8Element.shape_functions(xi, eta, zeta)
             phi = float(N @ fiber_angles_local)
             T_wrinkle = stress_transformation_3d(phi, axis='y')
-            T_total = T_wrinkle @ T_ply
+            T_wrinkle_eps = strain_transformation_3d(phi, axis='y')
 
-            expected_sigma_local = T_total @ results.stress_global[e, g]
-            expected_eps_local = T_total @ results.strain_global[e, g]
+            expected_sigma_local = (
+                T_ply @ (T_wrinkle @ results.stress_global[e, g])
+            )
+            expected_eps_local = (
+                T_ply_eps @ (T_wrinkle_eps @ results.strain_global[e, g])
+            )
 
             np.testing.assert_allclose(
                 results.stress_local[e, g],
@@ -154,3 +170,79 @@ def test_recover_element_results_recomputation_is_deterministic(
     np.testing.assert_array_equal(results1.stress_local, sl2)
     np.testing.assert_array_equal(results1.strain_global, eg2)
     np.testing.assert_array_equal(results1.strain_local, el2)
+
+
+# --------------------------------------------------------------------------- #
+# Frame-consistency invariants
+#
+# The two tests above check the transform against a hand-built copy of the
+# same algebra, so they would have agreed with a wrong convention as long
+# as both sides were wrong the same way — which is exactly what happened.
+# The two below are independent of how the transform is written: they are
+# physical statements about what "local frame" has to mean.
+# --------------------------------------------------------------------------- #
+
+
+def test_local_frame_satisfies_the_unrotated_constitutive_law(
+    parity_mesh_and_laminate,
+):
+    """``sigma_local == C_material @ eps_local``, to machine precision.
+
+    The whole point of the material frame is that the *unrotated*
+    stiffness holds in it.  This catches any mismatch between the pair
+    (``stress_local``, ``strain_local``) and the ``C_bar`` that produced
+    ``stress_global`` — wrong matrix, wrong order, or wrong axis — without
+    restating the transform algebra the implementation uses.
+    """
+    mesh, laminate = parity_mesh_and_laminate
+    solver = StaticSolver(mesh, laminate)
+    bcs = BoundaryHandler.compression_bcs(mesh, applied_strain=-0.01)
+    results = solver.solve(bcs)
+
+    C = laminate.plies[0].material.stiffness_matrix
+    predicted = results.strain_local @ C.T          # (n_elem, n_gp, 6)
+    peak = np.abs(results.stress_local).max()
+    assert peak > 1.0, "test is only meaningful under real load"
+    assert np.abs(predicted - results.stress_local).max() < 1e-9 * peak
+
+
+def test_wrinkle_rotation_of_a_90_deg_ply_leaves_local_sigma_11_alone():
+    """Why the composition order is what it is — a derivation anchor.
+
+    For a 90 deg ply the fibres run along global **y**, and the wrinkle
+    misalignment is a rotation about **y** — i.e. about that ply's own
+    fibre axis.  Material-frame ``sigma_11`` must therefore be completely
+    independent of the wrinkle angle.  ``T_ply @ T_wrinkle`` satisfies
+    that exactly; the reversed order drifts several percent per 0.1 rad.
+
+    NOTE: this is a statement about the transform algebra, not a guard on
+    ``recover_element_results`` — it builds ``C_bar`` itself and would
+    keep passing if the solver regressed.  The implementation guard is
+    :func:`test_local_frame_satisfies_the_unrotated_constitutive_law`,
+    which does fail on the reversed order.  This test exists so a future
+    reader can see *why* the order is not arbitrary before changing it.
+    """
+    from wrinklefe.core.transforms import (
+        rotate_stiffness_3d,
+        stress_transformation_3d,
+    )
+
+    mat = OrthotropicMaterial()
+    theta = np.radians(90.0)
+    T_ply = stress_transformation_3d(theta, axis="z")
+    eps = np.array([-8.0e-3, 1.5e-3, 1.0e-3, 2.0e-4, 5.0e-4, 8.0e-4])
+
+    reference = None
+    for phi in (0.0, 0.05, 0.10, 0.20):
+        C_bar = rotate_stiffness_3d(
+            rotate_stiffness_3d(mat.stiffness_matrix, theta, axis="z"),
+            phi, axis="y",
+        )
+        sigma_global = C_bar @ eps
+        T_wrinkle = stress_transformation_3d(phi, axis="y")
+        sigma_local = T_ply @ (T_wrinkle @ sigma_global)
+        if reference is None:
+            reference = sigma_local[0]
+            assert abs(reference) > 1.0
+        else:
+            np.testing.assert_allclose(sigma_local[0], reference, rtol=1e-12)

@@ -262,7 +262,7 @@ tension to every ply — 55 % of `Yt = 62.3 MPa`.
 
 | Parameter | Units | Default | Definition | Constraint |
 |-----------|-------|---------|------------|------------|
-| `delta_T` | °C | `0.0` | Uniform temperature change from the stress-free (cure) state, `T_service − T_stress_free`. Negative for a cure cool-down. Adds the CLT thermal resultants `N^T`/`M^T` to the ABD solve, and ply stresses are recovered from the mechanical (not total) strain, so the residual stress reaches the ply stresses and the first-ply-failure report. `0.0` (default) leaves every result bit-identical. | finite, `\|delta_T\| ≤ 1000`, and requires `analytical_only=True` |
+| `delta_T` | °C | `0.0` | Uniform temperature change from the stress-free (cure) state, `T_service − T_stress_free`. Negative for a cure cool-down. Adds the CLT thermal resultants `N^T`/`M^T` to the ABD solve on the analytical path and the element thermal initial-strain load vector `∫ Bᵀ C ε_th dV` on the FE path; stresses are recovered from the mechanical (not total) strain on both. `0.0` (default) leaves every result bit-identical. | finite, `\|delta_T\| ≤ 1000` |
 
 ```python
 config = AnalysisConfig(
@@ -271,7 +271,6 @@ config = AnalysisConfig(
     angles=[0, 45, -45, 90, 90, -45, 45, 0],
     ply_thickness=0.183,
     delta_T=-155.0,       # 177 °C cure -> 22 °C service
-    analytical_only=True,  # CLT path only — see below
 )
 result = WrinkleAnalysis(config).run()
 print(result.summary())          # states the ΔT and its sense

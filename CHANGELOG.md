@@ -14,6 +14,46 @@ version produced a given file.
 
 ## [Unreleased]
 
+### Fixed
+- Solver — **FE local-frame stress and strain were transformed with the
+  wrong matrix and in the wrong order** (found by audit).
+  `StaticSolver.recover_element_results` built one transform,
+  `T_total = T_wrinkle @ T_ply` from `stress_transformation_3d`, and applied
+  it to *both* the stress and the engineering-strain vector. Two distinct
+  errors:
+  1. **Wrong matrix for strain.** Engineering strain rotates with
+     `T_eps = R T_sigma R^-1` (`R = diag(1,1,1,2,2,2)`), not `T_sigma`.
+     Reusing the stress matrix mis-scaled every shear component of
+     `strain_local` by a factor of two, and mixed that error into the
+     normal components wherever the rotation couples normal to shear.
+  2. **Wrong composition order.** The element stiffness is built as
+     `C_bar = R_y(R_z(C)) = T_s(phi)⁻¹ T_s(th)⁻¹ C T_e(th) T_e(phi)`, so
+     `sigma_g = C_bar eps_g` implies
+     `sigma_local = T_ply @ T_wrinkle @ sigma_global` — the **ply**
+     transform on the left, because the wrinkle rotation is the outer one
+     and is therefore the first undone. The code had the two factors
+     reversed, so `stress_local` was not the material-frame stress of the
+     `stress_global` it had just computed.
+
+  The order error vanishes identically when either angle is zero
+  (`T(0) = I`), so **0 deg plies and pristine elements were always exact**
+  — which is why the UD validation ledger never drifted and still shows
+  zero drift after the fix. It bites on off-axis plies of a wrinkled
+  laminate: measured on a `[0/45/-45/90]s` IM7/8552 coupon at A = 0.3 mm,
+  `sigma_local` was off by up to **43.9 MPa (8.0 %) on the 90 deg plies**
+  and ~1 % on the ±45 deg plies, against a transverse strength of order
+  80 MPa. Because the failure criteria read `stress_local`, this reached
+  the matrix-mode failure indices.
+
+  Guarded going forward by an invariant that does not restate the transform
+  algebra: in the material frame the *unrotated* stiffness must hold,
+  `sigma_local == C_material @ eps_local`. That residual was 7.1e-3 of peak
+  stress before the fix and is 6.9e-16 after. A second test records the
+  physical reason the order is not arbitrary — for a 90 deg ply the wrinkle
+  rotation is about that ply's own fibre axis, so material-frame `sigma_11`
+  must be independent of the wrinkle angle, which only the correct order
+  satisfies.
+
 ### Added
 - Analysis — **the FE path now assembles the thermal initial-strain load
   vector** (issue #273, Stage 2 — *Fixes #273*). Stage 1 made
@@ -55,6 +95,16 @@ version produced a given file.
   content while no document referenced any of it.
 
 ### Numerical results
+- FE `stress_local` / `strain_local` — and therefore every failure index,
+  failure mode and retention factor derived from them — change for
+  laminates with **off-axis plies and a non-zero wrinkle angle**, per the
+  transform fix above. UD `[0]_n` results and all pristine elements are
+  **bit-identical**, and `python scripts/validate.py` shows zero ledger
+  drift. On a `[0/45/-45/90]s` coupon at A = 0.3 mm the LaRC05 maximum
+  failure index moves 0.8506 -> 0.8459 (-0.55 %) and the retention factor
+  0.84075 -> 0.84089: small at the maximum, because that maximum sits in
+  the fibre-dominated 0 deg plies which were never affected, but up to
+  8 % per element in the 90 deg plies where matrix modes are assessed.
 - FE stresses, failure indices and retention factors change when
   `delta_T != 0` — previously such a run was refused outright, so nothing
   that ran before produces a different number now (`delta_T == 0` is

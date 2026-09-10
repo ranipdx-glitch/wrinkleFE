@@ -665,7 +665,11 @@ class StaticSolver:
            (residual) stress; the reported strain stays the *total*
            kinematic strain ``B u``.
         3. Transform stress and strain to local material coordinates
-           using the ply angle and wrinkle misalignment.
+           using the ply angle and wrinkle misalignment.  Stress uses the
+           stress transformation ``T_sigma``; **engineering strain uses
+           the strain transformation** ``T_eps = R T_sigma R^-1``
+           (``R = diag(1,1,1,2,2,2)``), which is a different matrix
+           wherever the rotation couples a normal component to a shear.
 
         Quantities that are constant per element (``T_ply``, the element's
         node ids and per-node wrinkle angles) are computed once outside
@@ -827,6 +831,11 @@ class StaticSolver:
                 wrinkle_angles_gp = angle_scale * (N_gp @ fiber_angles_local)
 
             T_ply = stress_transformation_3d(ply_angle_rad, axis='z')
+            # Engineering STRAIN needs its own transformation: T_eps =
+            # R T_sig R^-1 with R = diag(1,1,1,2,2,2).  Reusing T_sig on a
+            # strain vector silently mis-scales every component that the
+            # rotation couples to a shear.
+            T_ply_eps = strain_transformation_3d(ply_angle_rad, axis='z')
             sig_g = np.empty((n_gp, 6))
             for g in range(n_gp):
                 phi = float(wrinkle_angles_gp[g])
@@ -847,10 +856,21 @@ class StaticSolver:
                 else:
                     sig_g[g] = C_bar @ eps_g[g]
 
+                # Composition order is fixed by how ``C_bar`` was built:
+                #     C_bar = R_y(R_z(C)) = Ts(phi)^-1 Ts(th)^-1 C Te(th) Te(phi)
+                # so   sigma_g = C_bar eps_g   implies
+                #     Ts(th) Ts(phi) sigma_g = C [Te(th) Te(phi) eps_g].
+                # The PLY transform therefore sits on the LEFT: the wrinkle
+                # rotation is the outer one taking the intermediate frame to
+                # global, so it is the first one undone.  (Reversing this is
+                # invisible for a 0 deg ply or a pristine element, where one
+                # factor is the identity, but reaches ~10 % on a 90 deg ply
+                # at phi = 0.1 rad.)
                 T_wrinkle = stress_transformation_3d(phi, axis='y')
-                T_total = T_wrinkle @ T_ply
-                stress_local[e, g] = T_total @ sig_g[g]
-                strain_local[e, g] = T_total @ eps_g[g]
+                stress_local[e, g] = T_ply @ (T_wrinkle @ sig_g[g])
+
+                T_wrinkle_eps = strain_transformation_3d(phi, axis='y')
+                strain_local[e, g] = T_ply_eps @ (T_wrinkle_eps @ eps_g[g])
 
             stress_global[e] = sig_g
             strain_global[e] = eps_g
